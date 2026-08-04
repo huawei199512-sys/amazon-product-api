@@ -13,6 +13,12 @@ const TOTAL_REQUEST_TIMEOUT = 60000; // 总请求60秒超时
 const CONCURRENT_PROXIES = 3; // 每轮并发的代理数量
 const MIN_REQUEST_INTERVAL = 300; // 300ms间隔（降低延迟）
 
+// 详情接口专用：更长超时和更激进并发
+const DETAIL_SINGLE_PROXY_TIMEOUT = 15000; // 详情单代理15秒超时
+const DETAIL_TOTAL_REQUEST_TIMEOUT = 90000; // 详情总请求90秒超时
+const DETAIL_CONCURRENT_PROXIES = 5; // 详情每轮并发5个代理
+const DETAIL_MAX_ROUNDS = 8; // 详情最多8轮
+
 let lastRequestTime = 0;
 
 async function sleep(ms) {
@@ -52,8 +58,16 @@ function isBlocked(html) {
   return patterns.some(p => lower.includes(p.toLowerCase()));
 }
 
-async function makeRequestWithProxy(url, params, lang = 'en') {
+async function makeRequestWithProxy(url, params, lang = 'en', options = {}) {
   await rateLimit();
+
+  const {
+    singleProxyTimeout = SINGLE_PROXY_TIMEOUT,
+    totalRequestTimeout = TOTAL_REQUEST_TIMEOUT,
+    concurrentProxies = CONCURRENT_PROXIES,
+    maxRounds = 8,
+    extraHeaders = {},
+  } = options;
 
   let fullUrl = url;
   if (params && typeof params === 'object') {
@@ -64,7 +78,7 @@ async function makeRequestWithProxy(url, params, lang = 'en') {
   }
 
   const domain = new URL(url).hostname;
-  const headers = getHeaders(lang, domain);
+  const headers = { ...getHeaders(lang, domain), ...extraHeaders };
   const startTime = Date.now();
   const attemptedProxies = [];
 
@@ -85,11 +99,11 @@ async function makeRequestWithProxy(url, params, lang = 'en') {
   function createProxyTask(proxy) {
     const agent = proxyManager.createAgent(proxy);
     const controller = new AbortController();
-    const abortTimer = setTimeout(() => controller.abort(), SINGLE_PROXY_TIMEOUT);
+    const abortTimer = setTimeout(() => controller.abort(), singleProxyTimeout);
 
     const taskPromise = axios.get(fullUrl, {
       headers, httpsAgent: agent, httpAgent: agent,
-      timeout: SINGLE_PROXY_TIMEOUT, signal: controller.signal,
+      timeout: singleProxyTimeout, signal: controller.signal,
       maxRedirects: 5, validateStatus: () => true,
     }).then(response => {
       clearTimeout(abortTimer);
@@ -137,18 +151,17 @@ async function makeRequestWithProxy(url, params, lang = 'en') {
   }
 
   let round = 0;
-  const maxRounds = 8;
   const seenProxies = new Set();
 
   while (round < maxRounds) {
     const elapsed = Date.now() - startTime;
-    if (elapsed >= TOTAL_REQUEST_TIMEOUT) {
+    if (elapsed >= totalRequestTimeout) {
       console.warn(`[Request] 总超时 (${(elapsed / 1000).toFixed(1)}s)`);
       break;
     }
 
-    let batch = getProxyBatch(CONCURRENT_PROXIES * 2).filter(p => !seenProxies.has(p));
-    batch = batch.slice(0, CONCURRENT_PROXIES);
+    let batch = getProxyBatch(concurrentProxies * 2).filter(p => !seenProxies.has(p));
+    batch = batch.slice(0, concurrentProxies);
     if (batch.length === 0) break;
 
     batch.forEach(p => seenProxies.add(p));
@@ -441,10 +454,27 @@ async function getProductDetail(asin, country = 'com', lang = 'en') {
     return { success: false, error: `不支持的站点: ${country}` };
   }
 
-  const detailUrl = `https://${siteConfig.domain}/dp/${asin}`;
+  const detailUrl = `https://${siteConfig.domain}/dp/${asin}?th=1&psc=1`;
   console.log(`[Detail] 获取商品详情: ${asin} from ${siteConfig.domain}`);
 
-  const { html, error, proxy_used, elapsed, attempted_proxies } = await makeRequestWithProxy(detailUrl, null, lang);
+  // 详情接口使用更长超时和更激进并发
+  const detailOptions = {
+    singleProxyTimeout: DETAIL_SINGLE_PROXY_TIMEOUT,
+    totalRequestTimeout: DETAIL_TOTAL_REQUEST_TIMEOUT,
+    concurrentProxies: DETAIL_CONCURRENT_PROXIES,
+    maxRounds: DETAIL_MAX_ROUNDS,
+    extraHeaders: {
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+    },
+  };
+
+  const { html, error, proxy_used, elapsed, attempted_proxies } = await makeRequestWithProxy(detailUrl, null, lang, detailOptions);
   
   if (!html) {
     return { 
