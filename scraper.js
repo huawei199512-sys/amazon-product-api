@@ -635,22 +635,6 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   });
   product.description_images = [...new Set(detailImages)];
 
-  // 商品属性规格
-  const bulletsElem = $('#detailBullets_feature_div').first();
-  if (bulletsElem.length) {
-    product.specifications = [];
-    bulletsElem.find('li').each((i, li) => {
-      const spans = $(li).find('span');
-      if (spans.length >= 2) {
-        const key = $(spans[0]).text().trim().replace(/:$/, '');
-        const value = $(spans[1]).text().trim();
-        if (key && value && key !== '\u200f') {
-          product.specifications.push({ key, value });
-        }
-      }
-    });
-  }
-
   // 技术详情
   const techDetails = $('#productDetails_techSpec_section_1').first();
   if (techDetails.length) {
@@ -659,6 +643,23 @@ function parseProductDetail(html, asin, siteConfig, lang) {
       const key = $(row).find('th').text().trim();
       const value = $(row).find('td').text().trim();
       if (key) product.tech_details[key] = value;
+    });
+  }
+  
+  // 产品详情表格
+  const detailTable = $('#productDetails_detailBullets_sections1, #detailBullets_feature_div').first();
+  if (detailTable.length) {
+    product.detail_table = {};
+    detailTable.find('li, tr').each((i, row) => {
+      const keyElem = $(row).find('span, th').first();
+      const valueElem = $(row).find('span:not(:first), td').first();
+      if (keyElem.length && valueElem.length) {
+        const key = keyElem.text().trim().replace(/:$/, '');
+        const value = valueElem.text().trim();
+        if (key && value && key.length < 100) {
+          product.detail_table[key] = value;
+        }
+      }
     });
   }
 
@@ -692,49 +693,20 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     product.gallery_images.unshift(product.main_image);
   }
 
-  // SKU变体
-  const skuVariants = extractSkuVariants(html, $);
-  product.sku_variants = skuVariants;
-  product.sku_count = skuVariants.length;
-
-  if (skuVariants.length === 0) {
-    const twisterItems = $('#twister .a-button-text, #twister a[href*="/dp/"]');
-    twisterItems.each((i, el) => {
-      const href = $(el).attr('href') || '';
-      const asinMatch = href.match(/\/dp\/([A-Z0-9]{10})/i);
-      if (asinMatch) {
-        const existing = product.sku_variants.find(v => v.asin === asinMatch[1]);
-        if (!existing) {
-          product.sku_variants.push({
-            asin: asinMatch[1],
-            title: $(el).text().trim(),
-            image: $(el).find('img').attr('src') || '',
-          });
-        }
-      }
-    });
-    product.sku_count = product.sku_variants.length;
-  }
-
-  // SKU维度
-  const dimensions = [];
-  $('#twister .twister-dim, [data-dimension-name]').each((i, dim) => {
-    const dimName = $(dim).attr('data-dimension-name') || $(dim).attr('aria-label') || '';
-    const variants = [];
-    $(dim).find('.a-button-text, a[href*="/dp/"]').each((j, btn) => {
-      const href = $(btn).attr('href') || '';
-      const asinMatch = href.match(/\/dp\/([A-Z0-9]{10})/i);
-      if (asinMatch) {
-        variants.push({ asin: asinMatch[1], title: $(btn).text().trim() });
-      }
-    });
-    if (variants.length > 0) {
-      dimensions.push({ dimension: dimName, variants });
-    }
-  });
-  if (dimensions.length > 0) {
-    product.sku_dimensions = dimensions;
-  }
+  // SKU变体 - 多种方式提取
+  const skuData = extractAllSkuData(html, $);
+  product.sku_variants = skuData.variants;
+  product.sku_count = skuData.variants.length;
+  product.sku_dimensions = skuData.dimensions;
+  product.sku_selection = skuData.selection;
+  product.sku_preview = skuData.preview;
+  product.sku_details = skuData.details;
+  
+  // 规格属性
+  product.specifications = extractSpecifications($);
+  
+  // 商品属性表格
+  product.attributes = extractAttributes($);
 
   // 关联商品
   const alsoBought = [];
@@ -799,68 +771,378 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   return product;
 }
 
-function extractSkuVariants(html, $) {
-  const variants = [];
+function extractAllSkuData(html, $) {
+  const result = {
+    variants: [],
+    dimensions: [],
+    selection: null,
+    preview: null,
+    details: []
+  };
+  
+  const seenAsins = new Set();
+  
+  // 方式1: 从JSON数据中提取
+  extractFromJsonData(html, result, seenAsins);
+  
+  // 方式2: 从twister选择器提取
+  extractFromTwister($, result, seenAsins);
+  
+  // 方式3: 从image-displayed SKU提取
+  extractFromImageDisplayed($, result, seenAsins);
+  
+  // 方式4: 从JavaScript变量提取
+  extractFromJsVariables(html, result, seenAsins);
+  
+  // 方式5: 从variation_parts提取
+  extractFromVariationParts($, result, seenAsins);
+  
+  // 提取SKU详情
+  if (result.variants.length > 0) {
+    result.details = extractSkuDetails(html, $, result.variants);
+  }
+  
+  return result;
+}
 
+function extractFromJsonData(html, result, seenAsins) {
   try {
     const patterns = [
-      /"variationDisplayLabels":\s*(\[[\s\S]*?\])/,
-      /"dimensionValuesDisplayData":\s*(\{[\s\S]*?\})/,
-      /"variationLabels":\s*(\[[\s\S]*?\])/,
+      { regex: /"variationDisplayLabels":\s*(\[[\s\S]*?\])/, type: 'labels' },
+      { regex: /"dimensionValuesDisplayData":\s*(\{[\s\S]*?\})/, type: 'dimensions' },
+      { regex: /"variationLabels":\s*(\[[\s\S]*?\])/, type: 'labels' },
+      { regex: /"skuSelection":\s*(\[[\s\S]*?\])/, type: 'selection' },
+      { regex: /"skuPreview":\s*(\[[\s\S]*?\])/, type: 'preview' },
+      { regex: /"item\.skus":\s*(\[[\s\S]*?\])/, type: 'skus' },
+      { regex: /"result\.skus":\s*(\[[\s\S]*?\])/, type: 'skus' },
+      { regex: /"detailData\.skus":\s*(\[[\s\S]*?\])/, type: 'skus' },
     ];
 
-    for (const pattern of patterns) {
-      const match = html.match(pattern);
-      if (match) {
-        try {
-          const data = JSON.parse(match[1]);
-          if (Array.isArray(data)) {
-            for (const item of data) {
-              if (typeof item === 'object') {
-                const asin = item.defaultAsin || item.asin;
-                if (asin) {
-                  variants.push({ asin, title: item.displayLabel || item.label || '', image: item.image || '' });
-                }
-              } else if (typeof item === 'string' && /^[A-Z0-9]{10}$/i.test(item)) {
-                variants.push({ asin: item });
-              }
-            }
-          } else if (typeof data === 'object') {
-            for (const [key, value] of Object.entries(data)) {
-              if (Array.isArray(value)) {
-                for (const asin of value) {
-                  if (/^[A-Z0-9]{10}$/i.test(asin)) {
-                    variants.push({ asin, attribute: key });
-                  }
-                }
-              }
-            }
-          }
-        } catch {
-          // ignore
+    for (const { regex, type } of patterns) {
+      const match = html.match(regex);
+      if (!match) continue;
+      
+      try {
+        const data = JSON.parse(match[1]);
+        
+        if (type === 'selection') {
+          result.selection = data;
+        } else if (type === 'preview') {
+          result.preview = data;
         }
+        
+        if (Array.isArray(data)) {
+          parseArrayData(data, result, seenAsins, type);
+        } else if (typeof data === 'object') {
+          parseObjectData(data, result, seenAsins, type);
+        }
+      } catch {
+        // ignore parse errors
       }
     }
   } catch {
     // ignore
   }
+}
 
-  if (variants.length === 0) {
-    $('#twister .a-button-link, .variation_parts a').each((i, el) => {
-      const href = $(el).attr('href') || '';
+function parseArrayData(data, result, seenAsins, type) {
+  for (const item of data) {
+    if (typeof item === 'object') {
+      const asin = item.defaultAsin || item.asin || item.sku || '';
+      if (asin && /^[A-Z0-9]{10}$/i.test(asin) && !seenAsins.has(asin)) {
+        seenAsins.add(asin);
+        result.variants.push({
+          asin,
+          title: item.displayLabel || item.label || item.title || '',
+          image: item.image || item.imageUrl || '',
+          price: item.price || item.salePrice || '',
+          attributes: item.attributes || item.variationAttributes || [],
+          sku_data: item
+        });
+      }
+    } else if (typeof item === 'string' && /^[A-Z0-9]{10}$/i.test(item) && !seenAsins.has(item)) {
+      seenAsins.add(item);
+      result.variants.push({ asin: item });
+    }
+  }
+}
+
+function parseObjectData(data, result, seenAsins, type) {
+  for (const [key, value] of Object.entries(data)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === 'string' && /^[A-Z0-9]{10}$/i.test(item) && !seenAsins.has(item)) {
+          seenAsins.add(item);
+          result.variants.push({ asin: item, dimension: key });
+        } else if (typeof item === 'object') {
+          const asin = item.defaultAsin || item.asin || '';
+          if (asin && !seenAsins.has(asin)) {
+            seenAsins.add(asin);
+            result.variants.push({
+              asin,
+              title: item.displayLabel || item.label || '',
+              image: item.image || '',
+              dimension: key
+            });
+          }
+        }
+      }
+    }
+  }
+}
+
+function extractFromTwister($, result, seenAsins) {
+  // 解析twister维度选择器
+  const twisterDims = $('#twister .twister-dim, [data-dimension-name], .twisterDimension');
+  const dimensions = [];
+  
+  twisterDims.each((i, dim) => {
+    const dimName = $(dim).attr('data-dimension-name') || $(dim).attr('aria-label') || $(dim).find('.a-row').first().text().trim() || '';
+    const variants = [];
+    
+    $(dim).find('.a-button-text, a[href*="/dp/"], .twister-attr').each((j, btn) => {
+      const href = $(btn).attr('href') || '';
       const asinMatch = href.match(/\/dp\/([A-Z0-9]{10})/i);
-      if (asinMatch) {
-        variants.push({ asin: asinMatch[1], title: $(el).text().trim(), image: $(el).find('img').attr('src') || '' });
+      const asin = asinMatch ? asinMatch[1] : ($(btn).attr('data-asin') || '');
+      const label = $(btn).attr('aria-label') || $(btn).text().trim() || '';
+      const image = $(btn).find('img').attr('src') || $(btn).find('img').attr('data-src') || '';
+      
+      if (asin && /^[A-Z0-9]{10}$/i.test(asin) && !seenAsins.has(asin)) {
+        seenAsins.add(asin);
+        const variant = { asin, title: label, image };
+        result.variants.push(variant);
+        variants.push({ asin, label });
+      } else if (label && !asin) {
+        variants.push({ label });
       }
     });
-  }
-
-  const seen = new Set();
-  return variants.filter(v => {
-    if (seen.has(v.asin)) return false;
-    seen.add(v.asin);
-    return true;
+    
+    if (dimName && variants.length > 0) {
+      dimensions.push({ dimension: dimName, variants });
+    }
   });
+  
+  if (dimensions.length > 0) {
+    result.dimensions = dimensions;
+  }
+  
+  // 备用: 从twister中提取所有链接
+  $('#twister a[href*="/dp/"]').each((i, el) => {
+    const href = $(el).attr('href') || '';
+    const asinMatch = href.match(/\/dp\/([A-Z0-9]{10})/i);
+    if (asinMatch && !seenAsins.has(asinMatch[1])) {
+      seenAsins.add(asinMatch[1]);
+      result.variants.push({
+        asin: asinMatch[1],
+        title: $(el).text().trim(),
+        image: $(el).find('img').attr('src') || ''
+      });
+    }
+  });
+}
+
+function extractFromImageDisplayed($, result, seenAsins) {
+  // 从图片显示区域提取SKU
+  $('img[data-asin], .image-displayed [data-asin]').each((i, img) => {
+    const asin = $(img).attr('data-asin') || '';
+    if (asin && /^[A-Z0-9]{10}$/i.test(asin) && !seenAsins.has(asin)) {
+      seenAsins.add(asin);
+      result.variants.push({
+        asin,
+        image: $(img).attr('src') || $(img).attr('data-old-hires') || ''
+      });
+    }
+  });
+}
+
+function extractFromJsVariables(html, result, seenAsins) {
+  try {
+    // 提取pageData或context中的SKU数据
+    const jsPatterns = [
+      /pageData\s*=\s*(\{[\s\S]*?\});/,
+      /context\s*=\s*(\{[\s\S]*?\});/,
+      /window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});/,
+      /"currentAsin"\s*:\s*"([A-Z0-9]{10})"/g,
+    ];
+    
+    for (const pattern of jsPatterns) {
+      const matches = [...html.matchAll(pattern)];
+      for (const match of matches) {
+        if (match[1]) {
+          const value = match[1].trim();
+          if (/^[A-Z0-9]{10}$/i.test(value) && !seenAsins.has(value)) {
+            seenAsins.add(value);
+            result.variants.push({ asin: value, is_current: true });
+          }
+        }
+      }
+    }
+    
+    // 提取所有ASIN引用
+    const asinRegex = /["']asin["']\s*:\s*["']([A-Z0-9]{10})["']/g;
+    let asinMatch;
+    while ((asinMatch = asinRegex.exec(html)) !== null) {
+      const asin = asinMatch[1];
+      if (!seenAsins.has(asin)) {
+        seenAsins.add(asin);
+        result.variants.push({ asin });
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function extractFromVariationParts($, result, seenAsins) {
+  // 从variation_parts提取
+  $('.variation_parts a, .variation_selector a, [class*="variation"] a').each((i, el) => {
+    const href = $(el).attr('href') || '';
+    const asinMatch = href.match(/\/dp\/([A-Z0-9]{10})/i) || href.match(/[?&]asin=([A-Z0-9]{10})/i);
+    if (asinMatch && !seenAsins.has(asinMatch[1])) {
+      seenAsins.add(asinMatch[1]);
+      result.variants.push({
+        asin: asinMatch[1],
+        title: $(el).text().trim(),
+        image: $(el).find('img').attr('src') || ''
+      });
+    }
+  });
+  
+  // 从选择器选项提取
+  $('select[id*="variation"], select[id*="sku"] option').each((i, opt) => {
+    const value = $(opt).attr('value') || '';
+    const asinMatch = value.match(/([A-Z0-9]{10})/i);
+    if (asinMatch && !seenAsins.has(asinMatch[1])) {
+      seenAsins.add(asinMatch[1]);
+      result.variants.push({
+        asin: asinMatch[1],
+        title: $(opt).text().trim()
+      });
+    }
+  });
+}
+
+function extractSkuDetails(html, $, variants) {
+  const details = [];
+  
+  for (const variant of variants.slice(0, 5)) {
+    const skuDetail = {
+      asin: variant.asin,
+      title: variant.title || '',
+      image: variant.image || '',
+      url: `https://www.amazon.com/dp/${variant.asin}`
+    };
+    
+    // 从JSON数据获取价格
+    try {
+      const pricePatterns = [
+        new RegExp(`"[^"]*price[^"]*"\\s*:\\s*\\{[^}]*"amount"\\s*:\\s*([\\d.]+)[^}]*"asin"\\s*:\\s*"${variant.asin}"`, 'i'),
+        new RegExp(`"asin"\\s*:\\s*"${variant.asin}"[^}]*"salePrice"\\s*:\\s*([\\d.]+)`, 'i'),
+        new RegExp(`"asin"\\s*:\\s*"${variant.asin}"[^}]*"discountPrice"\\s*:\\s*([\\d.]+)`, 'i'),
+      ];
+      
+      for (const pattern of pricePatterns) {
+        const match = html.match(pattern);
+        if (match) {
+          skuDetail.price = parseFloat(match[1]);
+          break;
+        }
+      }
+      
+      // 获取库存信息
+      const stockPattern = new RegExp(`"asin"\\s*:\\s*"${variant.asin}"[^}]*"availability"\\s*:\\s*"([^"]+)"`, 'i');
+      const stockMatch = html.match(stockPattern);
+      if (stockMatch) {
+        skuDetail.availability = stockMatch[1];
+        skuDetail.in_stock = stockMatch[1].toLowerCase().includes('in stock');
+      }
+      
+      // 获取规格属性
+      const specPattern = new RegExp(`"asin"\\s*:\\s*"${variant.asin}"[\\s\\S]*?"specAttrs"\\s*:\\s*(\\[[\\s\\S]*?\\])`, 'i');
+      const specMatch = html.match(specPattern);
+      if (specMatch) {
+        try {
+          skuDetail.spec_attrs = JSON.parse(specMatch[1]);
+        } catch {
+          // ignore
+        }
+      }
+      
+      // 获取评论数
+      const reviewPattern = new RegExp(`"asin"\\s*:\\s*"${variant.asin}"[\\s\\S]*?"saleCount"\\s*:\\s*(\\d+)`, 'i');
+      const reviewMatch = html.match(reviewPattern);
+      if (reviewMatch) {
+        skuDetail.sale_count = parseInt(reviewMatch[1]);
+      }
+      
+      // 可预订数量
+      const bookPattern = new RegExp(`"asin"\\s*:\\s*"${variant.asin}"[\\s\\S]*?"canBookCount"\\s*:\\s*(\\d+)`, 'i');
+      const bookMatch = html.match(bookPattern);
+      if (bookMatch) {
+        skuDetail.can_book_count = parseInt(bookMatch[1]);
+      }
+      
+    } catch {
+      // ignore
+    }
+    
+    // 从DOM获取SKU相关元素
+    const skuElement = $(`[data-asin="${variant.asin}"]`).first();
+    if (skuElement.length) {
+      skuElement.find('img').each((i, img) => {
+        const src = $(img).attr('src') || $(img).attr('data-src') || '';
+        if (src && !skuDetail.images) skuDetail.images = [];
+        if (src) skuDetail.images.push(src);
+      });
+    }
+    
+    details.push(skuDetail);
+  }
+  
+  return details;
+}
+
+function extractSpecifications($) {
+  const specs = [];
+  
+  // 方式1: 从detailBullets_feature_div提取
+  $('#detailBullets_feature_div li').each((i, li) => {
+    const spans = $(li).find('span');
+    if (spans.length >= 2) {
+      const key = $(spans[0]).text().trim().replace(/:$/, '');
+      const value = $(spans[1]).text().trim();
+      if (key && value && key !== '\u200f' && key.length < 100) {
+        specs.push({ key, value });
+      }
+    }
+  });
+  
+  // 方式2: 从productDetails_detailBullets提取
+  $('#productDetails_detailBullets_sections1 tr').each((i, row) => {
+    const key = $(row).find('th').text().trim();
+    const value = $(row).find('td').text().trim();
+    if (key && value && key.length < 100) {
+      const exists = specs.find(s => s.key === key);
+      if (!exists) specs.push({ key, value });
+    }
+  });
+  
+  return specs;
+}
+
+function extractAttributes($) {
+  const attributes = {};
+  
+  // 从attribute_list提取
+  $('#detailBullets_feature_div li, #productDetails_detailBullets_sections1 tr').each((i, el) => {
+    const key = $(el).find('span:first, th:first').text().trim().replace(/:$/, '');
+    const value = $(el).find('span:not(:first), td:first').text().trim();
+    if (key && value && key.length < 50) {
+      attributes[key] = value;
+    }
+  });
+  
+  return attributes;
 }
 
 module.exports = { searchProducts, getProductDetail };
