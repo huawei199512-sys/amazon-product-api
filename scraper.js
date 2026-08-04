@@ -3,14 +3,15 @@ const cheerio = require('cheerio');
 const proxyManager = require('./proxy');
 const { getSiteConfig } = require('./sites');
 
-// 超时策略（按用户明确要求）：
-// - 单代理30秒超时（AbortController强制，覆盖工作代理响应时间~15s）
-// - 总请求60秒（1分钟没返回JSON直接失败）
-// - 最多尝试5个代理（死代理ETIMEDOUT约21s自然失败，60s内可轮换2-3个；快失败代理可尝试更多）
-const SINGLE_PROXY_TIMEOUT = 30000; // 单个代理30秒超时（用户要求）
-const TOTAL_REQUEST_TIMEOUT = 60000; // 总请求60秒超时（1分钟没返回直接失败，用户要求）
-const MAX_PROXY_ATTEMPTS = 5; // 最多尝试5个代理（受60s总超时限制，实际约2-3个）
-const MIN_REQUEST_INTERVAL = 1000; // 1秒间隔
+// 超时与并发策略：
+// - 单代理8秒超时：死代理连接在8s内必超时（DNS/ETIMEDOUT），快速淘汰
+// - 每轮并发3个代理（Promise.race竞态）：第一个成功的立即返回
+// - 60秒总超时（1分钟没返回JSON直接失败）
+// - 8轮 × 3并发 = 最多24个代理在60s内
+const SINGLE_PROXY_TIMEOUT = 8000; // 单个代理8秒超时
+const TOTAL_REQUEST_TIMEOUT = 60000; // 总请求60秒超时
+const CONCURRENT_PROXIES = 3; // 每轮并发的代理数量
+const MIN_REQUEST_INTERVAL = 300; // 300ms间隔（降低延迟）
 
 let lastRequestTime = 0;
 
@@ -22,7 +23,7 @@ async function rateLimit() {
   const now = Date.now();
   const elapsed = now - lastRequestTime;
   if (elapsed < MIN_REQUEST_INTERVAL) {
-    await sleep(MIN_REQUEST_INTERVAL - elapsed + Math.random() * 300);
+    await sleep(MIN_REQUEST_INTERVAL - elapsed + Math.random() * 200);
   }
   lastRequestTime = Date.now();
 }
@@ -33,7 +34,6 @@ function getHeaders(lang, domain) {
     it: 'it-IT', es: 'es-ES', pt: 'pt-BR', ko: 'ko-KR',
     nl: 'nl-NL', sv: 'sv-SE', pl: 'pl-PL', zh: 'zh-CN',
   };
-  // 使用简化的headers（完整headers会导致代理被503/拦截）
   return {
     'User-Agent': proxyManager.getRandomUA(),
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -55,7 +55,6 @@ function isBlocked(html) {
 async function makeRequestWithProxy(url, params, lang = 'en') {
   await rateLimit();
 
-  // 手动构建完整URL（避免使用axios的params参数导致代理503错误）
   let fullUrl = url;
   if (params && typeof params === 'object') {
     const queryString = Object.entries(params)
@@ -67,113 +66,164 @@ async function makeRequestWithProxy(url, params, lang = 'en') {
   const domain = new URL(url).hostname;
   const headers = getHeaders(lang, domain);
   const startTime = Date.now();
-  let lastError = null;
+  const attemptedProxies = [];
 
-  // 纯代理模式 - 必须使用代理IP
   if (!proxyManager.isEnabled()) {
-    return { html: null, error: '代理模式未启用，无法发起请求' };
+    return { html: null, error: '代理模式未启用', attempted_proxies: attemptedProxies };
   }
 
-  // 检查是否有可用代理（不在此处刷新，避免10s刷新吃掉60s预算；依赖预加载的10000+代理池）
-  let proxy = proxyManager.getProxy();
-  if (!proxy) {
-    return { html: null, error: '无可用代理IP，请稍后重试' };
+  function getProxyBatch(count) {
+    const batch = [];
+    for (let i = 0; i < count; i++) {
+      const p = proxyManager.getProxy();
+      if (p) batch.push(p);
+    }
+    return batch;
   }
 
-  // 尝试多个代理（12秒单代理超时，60秒总超时）
-  for (let attempt = 0; attempt < MAX_PROXY_ATTEMPTS; attempt++) {
+  // 为单个代理创建请求任务（返回promise和abort函数）
+  function createProxyTask(proxy) {
+    const agent = proxyManager.createAgent(proxy);
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), SINGLE_PROXY_TIMEOUT);
+
+    const taskPromise = axios.get(fullUrl, {
+      headers, httpsAgent: agent, httpAgent: agent,
+      timeout: SINGLE_PROXY_TIMEOUT, signal: controller.signal,
+      maxRedirects: 5, validateStatus: () => true,
+    }).then(response => {
+      clearTimeout(abortTimer);
+      if (response.status === 200) {
+        const html = response.data;
+        if (isBlocked(html)) return { ok: false, blocked: true, error: '被反爬机制拦截' };
+        return { ok: true, html, error: null };
+      } else if (response.status === 302) {
+        const loc = response.headers.location || '';
+        if (loc.includes('signin') || loc.includes('login')) return { ok: false, error: '被重定向到登录页面' };
+        return { ok: true, html: response.data, error: null };
+      }
+      return { ok: false, error: `代理返回${response.status}` };
+    }).catch(error => {
+      clearTimeout(abortTimer);
+      const isTimeout = error.name === 'CanceledError' || error.name === 'AbortError' ||
+                        error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' ||
+                        error.code === 'ERR_CANCELED';
+      return { ok: false, error: isTimeout ? '超时' : error.message };
+    });
+
+    return {
+      proxy,
+      promise: taskPromise,
+      abort: () => {
+        clearTimeout(abortTimer);
+        try { controller.abort(); } catch {}
+      }
+    };
+  }
+
+  // 记录代理尝试结果
+  function recordResult(proxy, result, roundStart) {
+    const elapsed = ((Date.now() - roundStart) / 1000).toFixed(2);
+    if (result.ok && result.html) {
+      proxyManager.markSuccess(proxy);
+      attemptedProxies.push({ proxy, status: 'success', time: elapsed });
+    } else if (result.blocked) {
+      proxyManager.markFailed(proxy);
+      attemptedProxies.push({ proxy, status: 'blocked', time: elapsed });
+    } else {
+      proxyManager.markFailed(proxy);
+      attemptedProxies.push({ proxy, status: result.error || 'error', time: elapsed });
+    }
+  }
+
+  let round = 0;
+  const maxRounds = 8;
+  const seenProxies = new Set();
+
+  while (round < maxRounds) {
     const elapsed = Date.now() - startTime;
     if (elapsed >= TOTAL_REQUEST_TIMEOUT) {
-      console.warn(`[Request] 总超时 (${(elapsed / 1000).toFixed(1)}s)，停止尝试`);
+      console.warn(`[Request] 总超时 (${(elapsed / 1000).toFixed(1)}s)`);
       break;
     }
 
-    if (attempt > 0) {
-      proxy = proxyManager.getProxy();
-      if (!proxy) {
-        // 不刷新（太慢），直接停止；下个请求会从大代理池继续
-        console.warn('[Request] 无更多可用代理，停止尝试');
-        break;
-      }
-      console.log(`[Request] 切换代理: ${proxy}`);
-      await sleep(200);
+    let batch = getProxyBatch(CONCURRENT_PROXIES * 2).filter(p => !seenProxies.has(p));
+    batch = batch.slice(0, CONCURRENT_PROXIES);
+    if (batch.length === 0) break;
+
+    batch.forEach(p => seenProxies.add(p));
+    console.log(`[Request] 第${round + 1}轮: 并发尝试 ${batch.length} 个代理 (竞态模式)...`);
+
+    // 创建所有代理任务
+    const tasks = batch.map(p => createProxyTask(p));
+    const roundStartTime = Date.now();
+
+    // 使用 Promise.race 实现真正的竞态
+    // 第一个成功的代理立即返回，其余中止
+    let successOutcome = null;
+    let raceResolver;
+    const racePromise = new Promise(resolve => { raceResolver = resolve; });
+
+    const wrappedPromises = tasks.map(({ proxy, promise }) => {
+      return promise.then(result => {
+        if (!successOutcome && result.ok && result.html) {
+          // 第一个成功的！记录并立即resolve race
+          successOutcome = { proxy, result };
+          recordResult(proxy, result, roundStartTime);
+          raceResolver({ done: true });
+        } else {
+          recordResult(proxy, result, roundStartTime);
+        }
+        return { proxy, result };
+      }).catch(err => {
+        const result = { ok: false, error: err.message || '异常' };
+        recordResult(proxy, result, roundStartTime);
+        return { proxy, result };
+      });
+    });
+
+    // 等待条件：racePromise(成功) 或 allDone(全部完成)
+    const allDone = Promise.all(wrappedPromises);
+
+    // 竞态：谁先完成用谁
+    const raceResult = await Promise.race([
+      racePromise,           // 第一个成功的立即完成
+      allDone.then(() => ({ done: true, allFailed: !successOutcome })),  // 或全部失败
+    ]);
+
+    // 中止所有仍在运行的请求
+    tasks.forEach(t => t.abort());
+
+    if (successOutcome) {
+      // 确保所有代理都被记录（被中止的标记为aborted）
+      tasks.forEach(({ proxy }) => {
+        if (!attemptedProxies.find(a => a.proxy === proxy)) {
+          attemptedProxies.push({ proxy, status: 'aborted', time: ((Date.now() - roundStartTime) / 1000).toFixed(2) });
+        }
+      });
+
+      return {
+        html: successOutcome.result.html,
+        error: null,
+        proxy_used: successOutcome.proxy,
+        elapsed: ((Date.now() - startTime) / 1000).toFixed(2),
+        attempted_proxies: attemptedProxies,
+      };
     }
 
-    try {
-      const agent = proxyManager.createAgent(proxy);
-
-      // 使用 AbortController 强制超时（axios timeout 对 ETIMEDOUT 无效，必须用 signal 强制中断）
-      const controller = new AbortController();
-      const abortTimer = setTimeout(() => controller.abort(), SINGLE_PROXY_TIMEOUT);
-
-      let response;
-      try {
-        response = await axios.get(fullUrl, {
-          headers,
-          httpsAgent: agent,
-          httpAgent: agent,
-          timeout: SINGLE_PROXY_TIMEOUT, // 备用超时
-          signal: controller.signal, // 主超时强制器
-          maxRedirects: 5,
-          validateStatus: () => true,
-        });
-      } finally {
-        clearTimeout(abortTimer);
-      }
-
-      if (response.status === 200) {
-        const html = response.data;
-
-        if (isBlocked(html)) {
-          console.warn(`[Request] ${proxy} 被反爬机制拦截`);
-          proxyManager.markFailed(proxy);
-          lastError = '被反爬机制拦截';
-          continue;
-        }
-
-        proxyManager.markSuccess(proxy);
-        return {
-          html,
-          error: null,
-          proxy_used: proxy,
-          elapsed: ((Date.now() - startTime) / 1000).toFixed(2),
-        };
-      } else if (response.status === 302) {
-        const location = response.headers.location || '';
-        if (location.includes('signin') || location.includes('login')) {
-          console.warn(`[Request] ${proxy} 被重定向到登录页面`);
-          proxyManager.markFailed(proxy);
-          lastError = '被重定向到登录页面';
-          continue;
-        }
-        proxyManager.markSuccess(proxy);
-        return { html: response.data, error: null, proxy_used: proxy };
-      } else if (response.status === 403 || response.status === 429) {
-        console.warn(`[Request] ${proxy} 返回${response.status}`);
-        proxyManager.markFailed(proxy);
-        lastError = `代理返回${response.status}`;
-        continue;
-      } else {
-        console.warn(`[Request] ${proxy} 返回状态码 ${response.status}`);
-        proxyManager.markFailed(proxy);
-        lastError = `代理返回${response.status}`;
-        continue;
-      }
-    } catch (error) {
-      if (error.name === 'CanceledError' || error.name === 'AbortError' ||
-          error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' ||
-          error.code === 'ERR_CANCELED') {
-        console.warn(`[Request] ${proxy} 连接超时(强制${SINGLE_PROXY_TIMEOUT / 1000}s)`);
-      } else {
-        console.warn(`[Request] ${proxy} 请求错误: ${error.message}`);
-      }
-      proxyManager.markFailed(proxy);
-      lastError = error.message;
-      continue;
-    }
+    round++;
+    await sleep(100);
   }
 
-  return { html: null, error: lastError || '所有代理均请求失败' };
+  const uniqueErrors = [...new Set(attemptedProxies.map(a => a.status))];
+  const summary = uniqueErrors.length === 1 ? uniqueErrors[0] : uniqueErrors.join(', ');
+
+  return {
+    html: null,
+    error: `所有${attemptedProxies.length}个代理失败 (${summary})`,
+    proxy_used: 'none',
+    attempted_proxies: attemptedProxies,
+  };
 }
 
 function extractLdJson(html) {
@@ -220,13 +270,14 @@ async function searchProducts(keyword, country = 'com', lang = 'en', page = 1) {
 
   console.log(`[Search] 搜索 "${keyword}" on ${siteConfig.domain}, page ${page}`);
 
-  const { html, error, proxy_used, elapsed } = await makeRequestWithProxy(searchUrl, params, lang);
+  const { html, error, proxy_used, elapsed, attempted_proxies } = await makeRequestWithProxy(searchUrl, params, lang);
   
   if (!html) {
     return { 
       success: false, 
       error: `搜索失败: ${error}`,
       proxy_used: proxy_used || 'none',
+      attempted_proxies: attempted_proxies || [],
     };
   }
 
@@ -393,13 +444,14 @@ async function getProductDetail(asin, country = 'com', lang = 'en') {
   const detailUrl = `https://${siteConfig.domain}/dp/${asin}`;
   console.log(`[Detail] 获取商品详情: ${asin} from ${siteConfig.domain}`);
 
-  const { html, error, proxy_used, elapsed } = await makeRequestWithProxy(detailUrl, null, lang);
+  const { html, error, proxy_used, elapsed, attempted_proxies } = await makeRequestWithProxy(detailUrl, null, lang);
   
   if (!html) {
     return { 
       success: false, 
       error: `获取商品详情失败: ${error}`,
       proxy_used: proxy_used || 'none',
+      attempted_proxies: attempted_proxies || [],
     };
   }
 
