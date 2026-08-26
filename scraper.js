@@ -657,10 +657,10 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   }
   if (Object.keys(product.tech_details).length === 0) delete product.tech_details;
   
-  // 产品详情表格（多个Amazon页面ID备选）
+  // 产品详情表格（使用更简单的选择器，避免 cheerio 的 :not 兼容问题）
   const detailTableSelectors = [
-    '#productDetails_detailBullets_sections1',
     '#detailBullets_feature_div',
+    '#productDetails_detailBullets_sections1',
     '#productDetails_detailBullets_sections2',
     '#productDetails_detailBullets_sections3',
     '#productDetails_navInfo_sections',
@@ -673,17 +673,30 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   for (const sel of detailTableSelectors) {
     const detailTable = $(sel).first();
     if (detailTable.length) {
-      detailTable.find('li, tr').each((i, row) => {
-        const keyElem = $(row).find('span, th').first();
-        const valueElem = $(row).find('span:not(:first), td').first();
-        if (keyElem.length && valueElem.length) {
-          const key = keyElem.text().trim().replace(/:$/, '');
-          const value = valueElem.text().trim();
+      // 尝试 table 格式 (tr/th/td)
+      const rows = detailTable.find('tr');
+      if (rows.length > 0) {
+        rows.each((i, row) => {
+          const key = $(row).find('th').text().trim().replace(/:$/, '');
+          const value = $(row).find('td').text().trim();
           if (key && value && key.length < 100 && !product.detail_table[key]) {
             product.detail_table[key] = value;
           }
-        }
-      });
+        });
+      }
+      // 尝试 list 格式 (li > span + span)
+      if (Object.keys(product.detail_table).length === 0) {
+        detailTable.find('li').each((i, row) => {
+          const spans = $(row).find('span');
+          if (spans.length >= 2) {
+            const key = $(spans[0]).text().trim().replace(/:$/, '');
+            const value = $(spans[1]).text().trim();
+            if (key && value && key.length < 100 && !product.detail_table[key]) {
+              product.detail_table[key] = value;
+            }
+          }
+        });
+      }
       if (Object.keys(product.detail_table).length > 0) break;
     }
   }
@@ -752,7 +765,7 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   product.also_viewed = [...new Set(alsoViewed)];
 
   // Prime标识
-  product.is_prime = $('#pdp-obp-badge, .a-icon-prime, [data-prime], #badgePrime').length > 0;
+  product.is_prime = $('#pdp-obp-badge, i.a-icon-prime, .a-icon-prime, [data-prime], #badgePrime, #prime-badge, .prime-badge').length > 0;
 
   // 卖家信息
   const sellerSelectors = [
@@ -831,17 +844,24 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     }
   }
 
-  // 4) 从DOM遍历提取（最后手段，cheerio不支持:contains，改用filter遍历）
+  // 4) 从DOM遍历提取（最后手段，使用索引方式避免:not兼容问题）
   if (!product.sku) {
     const skuKeywords = ['item model number', 'sku', 'model number', 'part number', 'model #', 'manufacturer'];
     const detailRows = $('#productDetails_detailBullets_sections1 tr, #productDetails_techSpec_section_1 tr, #detailBullets_feature_div li');
     detailRows.each((i, row) => {
-      const label = $(row).find('th, span:first').text().trim().toLowerCase().replace(/:$/, '');
-      if (skuKeywords.some(k => label.includes(k))) {
-        const value = $(row).find('td, span:not(:first)').first().text().trim();
-        if (value) {
-          product.sku = value;
-          return false; // break each loop
+      // 尝试 table 格式
+      const labelTh = $(row).find('th').text().trim().toLowerCase().replace(/:$/, '');
+      if (labelTh && skuKeywords.some(k => labelTh.includes(k))) {
+        const value = $(row).find('td').text().trim();
+        if (value) { product.sku = value; return false; }
+      }
+      // 尝试 list 格式 (li > span + span)
+      const spans = $(row).find('span');
+      if (spans.length >= 2) {
+        const label = $(spans[0]).text().trim().toLowerCase().replace(/:$/, '');
+        if (skuKeywords.some(k => label.includes(k))) {
+          const value = $(spans[1]).text().trim();
+          if (value) { product.sku = value; return false; }
         }
       }
     });
@@ -876,19 +896,9 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     }
   });
 
-  // "About this item" bullet points
-  const aboutBullets = $('#feature-bullets ul.a-unordered-list li, #feature-bullets .a-list-item');
-  if (aboutBullets.length > 0) {
-    const bullets = [];
-    aboutBullets.each((i, el) => {
-      const text = $(el).text().trim();
-      if (text && text.length > 3) {
-        bullets.push(text);
-      }
-    });
-    if (bullets.length > 0) {
-      product.bullet_points = bullets;
-    }
+  // "About this item" bullet points（复用features，避免重复提取）
+  if (product.features && product.features.length > 0) {
+    product.bullet_points = [...product.features];
   }
 
   // Date First Available
@@ -1379,11 +1389,27 @@ function extractSpecifications($) {
   
   for (const sel of specSelectors) {
     $(sel).each((i, el) => {
-      const key = $(el).find('th, span:first').text().trim().replace(/:$/, '');
-      const value = $(el).find('td, span:not(:first)').first().text().trim();
-      if (key && value && key !== '\u200f' && key.length < 100 && !seenKeys.has(key)) {
-        seenKeys.add(key);
-        specs.push({ key, value });
+      // table tr 格式
+      const keyTh = $(el).find('th');
+      const valueTd = $(el).find('td');
+      if (keyTh.length && valueTd.length) {
+        const key = keyTh.text().trim().replace(/:$/, '');
+        const value = valueTd.text().trim();
+        if (key && value && key !== '\u200f' && key.length < 100 && !seenKeys.has(key)) {
+          seenKeys.add(key);
+          specs.push({ key, value });
+        }
+        return;
+      }
+      // li span 格式 (li > span + span)
+      const spans = $(el).find('span');
+      if (spans.length >= 2) {
+        const key = $(spans[0]).text().trim().replace(/:$/, '');
+        const value = $(spans[1]).text().trim();
+        if (key && value && key !== '\u200f' && key.length < 100 && !seenKeys.has(key)) {
+          seenKeys.add(key);
+          specs.push({ key, value });
+        }
       }
     });
     if (specs.length > 0) break;
@@ -1406,10 +1432,25 @@ function extractAttributes($) {
   
   for (const sel of attrSelectors) {
     $(sel).each((i, el) => {
-      const key = $(el).find('span:first, th:first').text().trim().replace(/:$/, '');
-      const value = $(el).find('span:not(:first), td:first').text().trim();
-      if (key && value && key.length < 50 && !attributes[key]) {
-        attributes[key] = value;
+      // table tr 格式
+      const keyTh = $(el).find('th:first');
+      const valueTd = $(el).find('td:first');
+      if (keyTh.length && valueTd.length) {
+        const key = keyTh.text().trim().replace(/:$/, '');
+        const value = valueTd.text().trim();
+        if (key && value && key.length < 50 && !attributes[key]) {
+          attributes[key] = value;
+        }
+        return;
+      }
+      // li span 格式 (li > span + span)
+      const spans = $(el).find('span');
+      if (spans.length >= 2) {
+        const key = $(spans[0]).text().trim().replace(/:$/, '');
+        const value = $(spans[1]).text().trim();
+        if (key && value && key.length < 50 && !attributes[key]) {
+          attributes[key] = value;
+        }
       }
     });
     if (Object.keys(attributes).length > 0) break;
