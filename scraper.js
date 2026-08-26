@@ -657,7 +657,7 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   }
   if (Object.keys(product.tech_details).length === 0) delete product.tech_details;
   
-  // 产品详情表格（使用更简单的选择器，避免 cheerio 的 :not 兼容问题）
+  // 产品详情表格（使用 a-text-bold 定位标签，避免 cheerio 嵌套 span 问题）
   const detailTableSelectors = [
     '#detailBullets_feature_div',
     '#productDetails_detailBullets_sections1',
@@ -684,15 +684,18 @@ function parseProductDetail(html, asin, siteConfig, lang) {
           }
         });
       }
-      // 尝试 list 格式 (li > span + span)
+      // 尝试 list 格式 (li > span.a-text-bold + span)
       if (Object.keys(product.detail_table).length === 0) {
         detailTable.find('li').each((i, row) => {
-          const spans = $(row).find('span');
-          if (spans.length >= 2) {
-            const key = $(spans[0]).text().trim().replace(/:$/, '');
-            const value = $(spans[1]).text().trim();
-            if (key && value && key.length < 100 && !product.detail_table[key]) {
-              product.detail_table[key] = value;
+          const labelSpan = $(row).find('span.a-text-bold, b, strong').first();
+          if (labelSpan.length) {
+            const key = labelSpan.text().trim().replace(/:$/, '').replace(/\s*‏\s*‎\s*/, '');
+            const valueSpan = labelSpan.next('span');
+            if (valueSpan.length) {
+              const value = valueSpan.text().trim();
+              if (key && value && key.length < 100 && !product.detail_table[key]) {
+                product.detail_table[key] = value;
+              }
             }
           }
         });
@@ -844,24 +847,27 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     }
   }
 
-  // 4) 从DOM遍历提取（最后手段，使用索引方式避免:not兼容问题）
+  // 4) 从DOM遍历提取（最后手段，使用 a-text-bold + next() 避免嵌套问题）
   if (!product.sku) {
     const skuKeywords = ['item model number', 'sku', 'model number', 'part number', 'model #', 'manufacturer'];
     const detailRows = $('#productDetails_detailBullets_sections1 tr, #productDetails_techSpec_section_1 tr, #detailBullets_feature_div li');
     detailRows.each((i, row) => {
-      // 尝试 table 格式
+      // 尝试 table 格式 (tr > th + td)
       const labelTh = $(row).find('th').text().trim().toLowerCase().replace(/:$/, '');
       if (labelTh && skuKeywords.some(k => labelTh.includes(k))) {
         const value = $(row).find('td').text().trim();
         if (value) { product.sku = value; return false; }
       }
-      // 尝试 list 格式 (li > span + span)
-      const spans = $(row).find('span');
-      if (spans.length >= 2) {
-        const label = $(spans[0]).text().trim().toLowerCase().replace(/:$/, '');
+      // 尝试 list 格式 (li > span.a-list-item > span.a-text-bold + span)
+      const labelSpan = $(row).find('span.a-text-bold').first();
+      if (labelSpan.length) {
+        const label = labelSpan.text().trim().toLowerCase().replace(/:$/, '').replace(/\s*‏\s*‎\s*/, '');
         if (skuKeywords.some(k => label.includes(k))) {
-          const value = $(spans[1]).text().trim();
-          if (value) { product.sku = value; return false; }
+          const valueSpan = labelSpan.next('span');
+          if (valueSpan.length) {
+            const value = valueSpan.text().trim();
+            if (value) { product.sku = value; return false; }
+          }
         }
       }
     });
@@ -1389,7 +1395,7 @@ function extractSpecifications($) {
   
   for (const sel of specSelectors) {
     $(sel).each((i, el) => {
-      // table tr 格式
+      // table tr 格式 (th + td)
       const keyTh = $(el).find('th');
       const valueTd = $(el).find('td');
       if (keyTh.length && valueTd.length) {
@@ -1401,14 +1407,17 @@ function extractSpecifications($) {
         }
         return;
       }
-      // li span 格式 (li > span + span)
-      const spans = $(el).find('span');
-      if (spans.length >= 2) {
-        const key = $(spans[0]).text().trim().replace(/:$/, '');
-        const value = $(spans[1]).text().trim();
-        if (key && value && key !== '\u200f' && key.length < 100 && !seenKeys.has(key)) {
-          seenKeys.add(key);
-          specs.push({ key, value });
+      // li span 格式 (li > span.a-list-item > span.a-text-bold + span)
+      const labelSpan = $(el).find('span.a-text-bold').first();
+      if (labelSpan.length) {
+        const key = labelSpan.text().trim().replace(/:$/, '').replace(/\s*‏\s*‎\s*/, '');
+        const valueSpan = labelSpan.next('span');
+        if (valueSpan.length) {
+          const value = valueSpan.text().trim();
+          if (key && value && key !== '\u200f' && key.length < 100 && !seenKeys.has(key)) {
+            seenKeys.add(key);
+            specs.push({ key, value });
+          }
         }
       }
     });
@@ -1432,7 +1441,7 @@ function extractAttributes($) {
   
   for (const sel of attrSelectors) {
     $(sel).each((i, el) => {
-      // table tr 格式
+      // table tr 格式 (th + td)
       const keyTh = $(el).find('th:first');
       const valueTd = $(el).find('td:first');
       if (keyTh.length && valueTd.length) {
@@ -1443,13 +1452,16 @@ function extractAttributes($) {
         }
         return;
       }
-      // li span 格式 (li > span + span)
-      const spans = $(el).find('span');
-      if (spans.length >= 2) {
-        const key = $(spans[0]).text().trim().replace(/:$/, '');
-        const value = $(spans[1]).text().trim();
-        if (key && value && key.length < 50 && !attributes[key]) {
-          attributes[key] = value;
+      // li span 格式 (li > span.a-list-item > span.a-text-bold + span)
+      const labelSpan = $(el).find('span.a-text-bold').first();
+      if (labelSpan.length) {
+        const key = labelSpan.text().trim().replace(/:$/, '').replace(/\s*‏\s*‎\s*/, '');
+        const valueSpan = labelSpan.next('span');
+        if (valueSpan.length) {
+          const value = valueSpan.text().trim();
+          if (key && value && key.length < 50 && !attributes[key]) {
+            attributes[key] = value;
+          }
         }
       }
     });
