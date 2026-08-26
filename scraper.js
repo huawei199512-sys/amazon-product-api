@@ -294,6 +294,7 @@ async function searchProducts(keyword, country = 'com', lang = 'en', page = 1) {
 
   return {
     success: true,
+    data_version: '1.1', // 版本标记方便验证
     keyword,
     country,
     page,
@@ -488,6 +489,7 @@ async function getProductDetail(asin, country = 'com', lang = 'en') {
 
   return {
     success: true,
+    data_version: '1.1', // 版本标记方便验证
     asin,
     country,
     product,
