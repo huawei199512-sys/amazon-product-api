@@ -3,13 +3,10 @@ const cors = require('cors');
 const scraper = require('./scraper');
 const sites = require('./sites');
 const proxyManager = require('./proxy');
-
 const app = express();
 const PORT = process.env.PORT || 8000;
-
 app.use(cors());
 app.use(express.json());
-
 // ============ 全局错误防护（防止未捕获异常导致服务崩溃）============
 process.on('uncaughtException', (err) => {
   console.error('[UncaughtException]', err.message);
@@ -17,12 +14,10 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('[UnhandledRejection]', err && err.message ? err.message : err);
 });
-
 // ============ 健康检查端点（Render 必需，必须最先注册）============
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
-
 // ============ 首页 ============
 app.get('/', (req, res) => {
   res.json({
@@ -48,7 +43,6 @@ app.get('/', (req, res) => {
     proxy_status: proxyManager.getStatus(),
   });
 });
-
 // ============ 站点列表 ============
 app.get('/api/sites', (req, res) => {
   const siteList = Object.entries(sites.SITES).map(([code, config]) => ({
@@ -60,16 +54,13 @@ app.get('/api/sites', (req, res) => {
   }));
   res.json(siteList);
 });
-
 // ============ 搜索商品 ============
 app.get('/api/search', async (req, res) => {
   try {
     const { keyword, country = 'com', lang = 'en', page = 1 } = req.query;
-
     if (!keyword) {
       return res.status(400).json({ success: false, error: 'keyword参数必填' });
     }
-
     if (!sites.getSiteConfig(country)) {
       return res.status(400).json({
         success: false,
@@ -77,10 +68,8 @@ app.get('/api/search', async (req, res) => {
         supported_sites: sites.getAllSiteKeys()
       });
     }
-
     // 强制启用代理
     proxyManager.setEnabled(true);
-
     const result = await scraper.searchProducts(keyword, country, lang, parseInt(page));
     res.json(result);
   } catch (error) {
@@ -88,13 +77,11 @@ app.get('/api/search', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 // ============ 商品详情 ============
 app.get('/api/product/:asin', async (req, res) => {
   try {
     const { asin } = req.params;
     const { country = 'com', lang = 'en' } = req.query;
-
     if (!sites.getSiteConfig(country)) {
       return res.status(400).json({
         success: false,
@@ -102,10 +89,8 @@ app.get('/api/product/:asin', async (req, res) => {
         supported_sites: sites.getAllSiteKeys()
       });
     }
-
     // 强制启用代理
     proxyManager.setEnabled(true);
-
     const result = await scraper.getProductDetail(asin, country, lang);
     res.json(result);
   } catch (error) {
@@ -113,12 +98,10 @@ app.get('/api/product/:asin', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 // ============ 代理状态 ============
 app.get('/api/proxy/status', (req, res) => {
   res.json(proxyManager.getStatus());
 });
-
 // ============ 手动刷新代理池 ============
 app.post('/api/proxy/refresh', async (req, res) => {
   try {
@@ -128,12 +111,10 @@ app.post('/api/proxy/refresh', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.post('/api/proxy/toggle', (req, res) => {
   proxyManager.setEnabled(true);
   res.json({ success: true, proxy_enabled: true, note: '代理模式为强制开启状态' });
 });
-
 // ============ 兜底路由（返回JSON而非默认404页面）============
 app.use((req, res) => {
   res.status(404).json({
@@ -150,7 +131,6 @@ app.use((req, res) => {
     ],
   });
 });
-
 // ============ 关键：先启动服务器，再做后台初始化 ============
 // Render 健康检查需要服务立即响应，不能等代理池初始化
 app.listen(PORT, '0.0.0.0', () => {
@@ -160,24 +140,18 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('  模式: 强制代理模式');
   console.log('  站点数: ' + sites.getAllSiteKeys().length);
   console.log('========================================');
-
   // 服务启动后，后台静默初始化代理池（不阻塞请求）
   setTimeout(async () => {
     try {
       console.log('[Init] 后台初始化代理池...');
       await proxyManager.refreshProxies(true);
+      // 启动自动刷新定时器（每30分钟，与1688/JD方案一致）
+      proxyManager.startAutoRefresh(30);
       console.log('[Init] 代理池初始化完成');
     } catch (e) {
       console.warn('[Init] 代理池初始化失败（不影响服务运行，请求时重试）:', e.message);
+      // 即使初始化失败，仍然启动定时器（30分钟后重试）
+      proxyManager.startAutoRefresh(30);
     }
   }, 1000);
 });
-
-// ============ 定时刷新代理池（5分钟一次，避免Render免费版CPU/内存压力）============
-setInterval(async () => {
-  try {
-    await proxyManager.refreshProxies(false);
-  } catch (e) {
-    console.warn('[AutoRefresh] 代理刷新失败:', e.message);
-  }
-}, 300000); // 5分钟
