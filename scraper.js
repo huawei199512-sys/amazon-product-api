@@ -3,20 +3,20 @@ const cheerio = require('cheerio');
 const proxyManager = require('./proxy');
 const { getSiteConfig } = require('./sites');
 
-// 超时与并发策略：
-// - 单代理8秒超时：死代理连接在8s内必超时（DNS/ETIMEDOUT），快速淘汰
-// - 每轮并发3个代理（Promise.race竞态）：第一个成功的立即返回
-// - 60秒总超时（1分钟没返回JSON直接失败）
-// - 8轮 × 3并发 = 最多24个代理在60s内
-const SINGLE_PROXY_TIMEOUT = 8000; // 单个代理8秒超时
-const TOTAL_REQUEST_TIMEOUT = 60000; // 总请求60秒超时
-const CONCURRENT_PROXIES = 3; // 每轮并发的代理数量
-const MIN_REQUEST_INTERVAL = 300; // 300ms间隔（降低延迟）
+// 超时与并发策略（激进模式，针对免费代理优化）：
+// - 单代理5秒超时：快速淘汰死代理
+// - 每轮并发10个代理（Promise.race竞态）：第一个成功的立即返回
+// - 30秒总超时：快速失败，不要等太久
+// - 6轮 × 10并发 = 最多60个代理在30s内
+const SINGLE_PROXY_TIMEOUT = 5000; // 单个代理5秒超时（之前8秒）
+const TOTAL_REQUEST_TIMEOUT = 30000; // 总请求30秒超时（之前60秒）
+const CONCURRENT_PROXIES = 10; // 每轮并发的代理数量（之前3个）
+const MIN_REQUEST_INTERVAL = 100; // 100ms间隔（降低延迟，之前300ms）
 
 // 详情接口专用：更长超时和更激进并发
-const DETAIL_SINGLE_PROXY_TIMEOUT = 15000; // 详情单代理15秒超时
-const DETAIL_TOTAL_REQUEST_TIMEOUT = 90000; // 详情总请求90秒超时
-const DETAIL_CONCURRENT_PROXIES = 5; // 详情每轮并发5个代理
+const DETAIL_SINGLE_PROXY_TIMEOUT = 8000; // 详情单代理8秒超时（之前15秒）
+const DETAIL_TOTAL_REQUEST_TIMEOUT = 60000; // 详情总请求60秒超时（之前90秒）
+const DETAIL_CONCURRENT_PROXIES = 15; // 详情每轮并发15个代理（之前5个）
 const DETAIL_MAX_ROUNDS = 8; // 详情最多8轮
 
 let lastRequestTime = 0;
@@ -87,12 +87,7 @@ async function makeRequestWithProxy(url, params, lang = 'en', options = {}) {
   }
 
   function getProxyBatch(count) {
-    const batch = [];
-    for (let i = 0; i < count; i++) {
-      const p = proxyManager.getProxy();
-      if (p) batch.push(p);
-    }
-    return batch;
+    return proxyManager.getProxyBatch(count);
   }
 
   // 为单个代理创建请求任务（返回promise和abort函数）

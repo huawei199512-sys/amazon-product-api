@@ -145,13 +145,13 @@ app.listen(PORT, '0.0.0.0', () => {
     try {
       console.log('[Init] 后台初始化代理池...');
       await proxyManager.refreshProxies(true);
-      // 启动自动刷新定时器（每30分钟，与1688/JD方案一致）
-      proxyManager.startAutoRefresh(30);
+      // 启动自动刷新定时器（每5分钟，免费代理变化快）
+      proxyManager.startAutoRefresh(5);
       console.log('[Init] 代理池初始化完成');
     } catch (e) {
       console.warn('[Init] 代理池初始化失败（不影响服务运行，请求时重试）:', e.message);
-      // 即使初始化失败，仍然启动定时器（30分钟后重试）
-      proxyManager.startAutoRefresh(30);
+      // 即使初始化失败，仍然启动定时器（5分钟后重试）
+      proxyManager.startAutoRefresh(5);
     }
   }, 1000);
 });
