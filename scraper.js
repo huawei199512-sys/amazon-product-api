@@ -768,6 +768,235 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     product.fulfilled_by = fulfilledByElem.text().trim();
   }
 
+  // ==================== 新增字段 ====================
+
+  // SKU (Item model number / Manufacturer part number)
+  product.sku = '';
+  // 从detail_table中提取
+  if (product.detail_table) {
+    const skuKeys = ['Item model number', 'SKU', 'Model Number', 'Model', 'Model Number:', 'Part Number', 'Model #', 'Manufacturer part number'];
+    for (const key of skuKeys) {
+      if (product.detail_table[key]) {
+        product.sku = product.detail_table[key];
+        break;
+      }
+    }
+  }
+  // 从tech_details中提取
+  if (!product.sku && product.tech_details) {
+    const skuKeys = ['Item model number', 'SKU', 'Model Number', 'Model', 'Part Number', 'Model #'];
+    for (const key of skuKeys) {
+      if (product.tech_details[key]) {
+        product.sku = product.tech_details[key];
+        break;
+      }
+    }
+  }
+  // 从LD+JSON中提取
+  if (!product.sku) {
+    const ldJson = extractLdJson(html);
+    if (ldJson.length > 0) {
+      const productData = ldJson.find(item => item['@type'] === 'Product');
+      if (productData) {
+        product.sku = productData.sku || productData.mpn || productData.model || '';
+      }
+    }
+  }
+  // 从selectors中提取
+  if (!product.sku) {
+    const skuSelectors = ['#productDetails_detailBullets_sections1 tr:contains("Item model number") td',
+      '#productDetails_detailBullets_sections1 tr:contains("SKU") td',
+      '#productDetails_techSpec_section_1 tr:contains("Item model number") td',
+      '#productDetails_techSpec_section_1 tr:contains("SKU") td'];
+    for (const sel of skuSelectors) {
+      const elem = $(sel).first();
+      if (elem.length) {
+        product.sku = elem.text().trim();
+        break;
+      }
+    }
+  }
+
+  // 分类路径 (breadcrumb)
+  const breadcrumbElem = $('#wayfinding-breadcrumbs_container ul.a-unordered-list, #breadcrumb li, .a-breadcrumb li, #wayfinding-breadcrumbs_feature_div li');
+  if (breadcrumbElem.length) {
+    const categories = [];
+    breadcrumbElem.each((i, el) => {
+      const text = $(el).text().trim();
+      if (text && text !== '›' && text !== '›') {
+        categories.push(text.replace(/[›\s]+/g, '').trim());
+      }
+    });
+    product.category = categories.filter(c => c).join(' > ');
+    product.category_path = categories.filter(c => c);
+  }
+
+  // Best Sellers Rank
+  const bsrElem = $('#productDetails_detailBullets_sections1 tr:contains("Best Sellers Rank") td, #detailBullets_feature_div li:contains("Best Sellers Rank")');
+  if (bsrElem.length) {
+    const bsrText = bsrElem.text().trim();
+    product.best_sellers_rank = bsrText;
+    // 提取排名数字
+    const rankMatch = bsrText.match(/#([\d,]+)/);
+    if (rankMatch) {
+      product.best_sellers_rank_value = parseInt(rankMatch[1].replace(/,/g, ''));
+    }
+  }
+
+  // "About this item" bullet points
+  const aboutBullets = $('#feature-bullets ul.a-unordered-list li, #feature-bullets .a-list-item');
+  if (aboutBullets.length > 0) {
+    const bullets = [];
+    aboutBullets.each((i, el) => {
+      const text = $(el).text().trim();
+      if (text && text.length > 3) {
+        bullets.push(text);
+      }
+    });
+    if (bullets.length > 0) {
+      product.bullet_points = bullets;
+    }
+  }
+
+  // Date First Available
+  if (product.detail_table) {
+    const dateKeys = ['Date First Available', 'Date First Available:', '上市日期'];
+    for (const key of dateKeys) {
+      if (product.detail_table[key]) {
+        product.date_first_available = product.detail_table[key];
+        break;
+      }
+    }
+  }
+
+  // Manufacturer
+  if (product.detail_table) {
+    const mfrKeys = ['Manufacturer', 'Manufacturer:', '品牌', 'Brand'];
+    for (const key of mfrKeys) {
+      if (product.detail_table[key] && product.detail_table[key] !== product.brand) {
+        product.manufacturer = product.detail_table[key];
+        break;
+      }
+    }
+  }
+  if (!product.manufacturer) {
+    const ldJson = extractLdJson(html);
+    if (ldJson.length > 0) {
+      const productData = ldJson.find(item => item['@type'] === 'Product');
+      if (productData && productData.manufacturer) {
+        product.manufacturer = productData.manufacturer.name || productData.manufacturer;
+      }
+    }
+  }
+
+  // Product Dimensions & Weight
+  if (product.detail_table) {
+    const dimKey = ['Product Dimensions', 'Item Dimensions', 'Dimensions', 'Package Dimensions', '产品尺寸'];
+    for (const key of dimKey) {
+      if (product.detail_table[key]) {
+        product.dimensions = product.detail_table[key];
+        break;
+      }
+    }
+    const weightKey = ['Item Weight', 'Weight', 'Product Weight', 'Package Weight', '商品重量'];
+    for (const key of weightKey) {
+      if (product.detail_table[key]) {
+        product.weight = product.detail_table[key];
+        break;
+      }
+    }
+  }
+
+  // Video URL
+  const videoElem = $('video[data-video-url], #video-tricker video, [data-video-url]').first();
+  if (videoElem.length) {
+    product.video_url = videoElem.attr('data-video-url') || videoElem.attr('src') || '';
+  }
+  if (!product.video_url) {
+    $('#video-tricker video source, #video-tricker-tricker video source').each((i, source) => {
+      const src = $(source).attr('src') || '';
+      if (src && !product.video_url) {
+        product.video_url = src;
+      }
+    });
+  }
+  // 从LD+JSON中提取视频
+  if (!product.video_url) {
+    const ldJson = extractLdJson(html);
+    if (ldJson.length > 0) {
+      const productData = ldJson.find(item => item['@type'] === 'Product');
+      if (productData && productData.video) {
+        product.video_url = productData.video.contentUrl || productData.video.embedUrl || '';
+      }
+    }
+  }
+
+  // Coupon信息
+  const couponElem = $('#couponText, .promoTextBlock, .coupon-badge, .deal-badge, [data-coupon]').first();
+  if (couponElem.length) {
+    product.coupon = couponElem.text().trim();
+  }
+  if (!product.coupon) {
+    const couponRegex = /Coupon.*?(\d+%|\$[\d.]+)/i;
+    const couponMatch = html.match(couponRegex);
+    if (couponMatch) {
+      product.coupon = couponMatch[0].trim();
+    }
+  }
+
+  // Deal/Lightning Deal信息
+  const dealElem = $('.deal-price, .dealBadge, .deal-price-label, #dealBadge, #priceblock_dealprice').first();
+  if (dealElem.length) {
+    const dealText = dealElem.text().trim();
+    if (dealText) {
+      product.deal_info = dealText;
+    }
+  }
+  // 检查是否有闪电特价
+  const lightningDealBadge = $('.deal-share-badge, .gb-font-lighting-deal, .a-deal-badge, .badgeText:contains("Deal")').first();
+  if (lightningDealBadge.length) {
+    product.is_deal = true;
+    product.deal_type = 'Lightning Deal';
+  }
+  // 检查促销
+  const promotionElem = $('#promoPriceBlockMessage, #promoMessage, .promoPriceBlockMessage').first();
+  if (promotionElem.length) {
+    product.promotion = promotionElem.text().trim();
+  }
+
+  // 订阅折扣 (Subscribe & Save)
+  const sasElem = $('.a-price-savings:contains("Subscribe"), .sns-promotion, #sns-promotion, [data-sns-promotion]').first();
+  if (sasElem.length || html.includes('Subscribe & Save') || html.includes('subscribe-and-save')) {
+    product.subscribe_and_save = true;
+    const sasText = sasElem.length ? sasElem.text().trim() : '';
+    if (sasText) {
+      product.subscribe_save_discount = sasText;
+    }
+  }
+
+  // 退货政策
+  const returnElem = $('#returns-policy, #return-policy, .a-expander-content:contains("Return"), [data-feature-name="return-policy"]').first();
+  if (returnElem.length) {
+    product.return_policy = returnElem.text().trim().substring(0, 500);
+  }
+
+  // 商品数量/包装数量
+  if (product.detail_table) {
+    const countKeys = ['Item Quantity', 'Number of Items', 'Count', 'Packaging Quantity', '数量'];
+    for (const key of countKeys) {
+      if (product.detail_table[key]) {
+        product.item_count = product.detail_table[key];
+        break;
+      }
+    }
+  }
+
+  // 商品所在大类
+  const departmentElem = $('#nav-subnav, #departments, #searchDropdownBox option[selected], .nav-search-label').first();
+  if (departmentElem.length) {
+    product.department = departmentElem.text().trim();
+  }
+
   return product;
 }
 
@@ -1146,3 +1375,4 @@ function extractAttributes($) {
 }
 
 module.exports = { searchProducts, getProductDetail };
+
