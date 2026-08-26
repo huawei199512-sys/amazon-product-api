@@ -294,7 +294,7 @@ async function searchProducts(keyword, country = 'com', lang = 'en', page = 1) {
 
   return {
     success: true,
-    data_version: '1.1', // 版本标记方便验证
+    data_version: '1.2', // 版本标记方便验证
     keyword,
     country,
     page,
@@ -489,7 +489,7 @@ async function getProductDetail(asin, country = 'com', lang = 'en') {
 
   return {
     success: true,
-    data_version: '1.1', // 版本标记方便验证
+    data_version: '1.2', // 版本标记方便验证
     asin,
     country,
     product,
@@ -640,8 +640,8 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     '#techSpec_section_1',
     '#productSpecifications',
     '.tech-specs',
-    '#productDetails_db_sections tr',
-    '#product_details_tabs tr',
+    '#productDetails_db_sections',
+    '#product_details_tabs',
   ];
   product.tech_details = {};
   for (const sel of techDetailSelectors) {
@@ -655,6 +655,22 @@ function parseProductDetail(html, asin, siteConfig, lang) {
         }
       });
       if (Object.keys(product.tech_details).length > 0) break;
+    }
+  }
+  if (Object.keys(product.tech_details).length === 0) {
+    // 正则后备：直接从原始HTML提取技术详情（不依赖DOM结构）
+    const techHtmlMatch = html.match(/<div[^>]*id="productDetails_techSpec_section_1"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
+    if (techHtmlMatch) {
+      const techHtml = techHtmlMatch[1];
+      const trRegex = /<tr[^>]*>(?:<th[^>]*>([\s\S]*?)<\/th>(?:\s*<td[^>]*>([\s\S]*?)<\/td>)?)<\/tr>/gi;
+      let trMatch;
+      while ((trMatch = trRegex.exec(techHtml)) !== null) {
+        const key = cheerio.load(trMatch[1]).text().trim();
+        const value = trMatch[2] ? cheerio.load(trMatch[2]).text().trim() : '';
+        if (key && value && !product.tech_details[key]) {
+          product.tech_details[key] = value;
+        }
+      }
     }
   }
   if (Object.keys(product.tech_details).length === 0) delete product.tech_details;
@@ -705,6 +721,40 @@ function parseProductDetail(html, asin, siteConfig, lang) {
       if (Object.keys(product.detail_table).length > 0) break;
     }
   }
+  if (Object.keys(product.detail_table).length === 0) {
+    // 正则后备：直接从原始HTML提取产品详情表（不依赖DOM结构）
+    const detailHtmlMatch = html.match(/<div[^>]*id="productDetails_detailBullets_sections1"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
+    if (detailHtmlMatch) {
+      const detailHtml = detailHtmlMatch[1];
+      // 匹配 tr/th/td 格式
+      const trRegex = /<tr[^>]*>(?:<th[^>]*>([\s\S]*?)<\/th>(?:\s*<td[^>]*>([\s\S]*?)<\/td>)?)<\/tr>/gi;
+      let trMatch;
+      while ((trMatch = trRegex.exec(detailHtml)) !== null) {
+        const key = cheerio.load(trMatch[1]).text().trim().replace(/:$/, '');
+        const value = trMatch[2] ? cheerio.load(trMatch[2]).text().trim() : '';
+        if (key && value && key.length < 100 && !product.detail_table[key]) {
+          product.detail_table[key] = value;
+        }
+      }
+      // 匹配 li/span 格式
+      if (Object.keys(product.detail_table).length === 0) {
+        const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/gi;
+        let liMatch;
+        while ((liMatch = liRegex.exec(detailHtml)) !== null) {
+          const liHtml = liMatch[1];
+          const labelMatch = liHtml.match(/<span[^>]*class="[^"]*a-text-bold[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
+          if (labelMatch) {
+            const key = cheerio.load(labelMatch[1]).text().trim().replace(/:$/, '').replace(/\s*‏\s*‎\s*/, '');
+            const valueMatch = liHtml.match(/<\/span>\s*<span[^>]*>([\s\S]*?)<\/span>/i);
+            const value = valueMatch ? cheerio.load(valueMatch[1]).text().trim() : '';
+            if (key && value && key.length < 100 && !product.detail_table[key]) {
+              product.detail_table[key] = value;
+            }
+          }
+        }
+      }
+    }
+  }
   if (Object.keys(product.detail_table).length === 0) delete product.detail_table;
 
   // 主图
@@ -748,9 +798,25 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   
   // 规格属性
   product.specifications = extractSpecifications($);
+  if (product.specifications.length === 0 && product.detail_table) {
+    // 后备：从detail_table转为specifications格式
+    for (const [key, value] of Object.entries(product.detail_table)) {
+      if (key && value && key.length < 100) {
+        product.specifications.push({ key, value });
+      }
+    }
+  }
   
   // 商品属性表格
   product.attributes = extractAttributes($);
+  if (Object.keys(product.attributes).length === 0 && product.detail_table) {
+    // 后备：从detail_table转为attributes格式
+    for (const [key, value] of Object.entries(product.detail_table)) {
+      if (key && value && key.length < 50) {
+        product.attributes[key] = value;
+      }
+    }
+  }
 
   // 关联商品
   const alsoBought = [];
@@ -849,10 +915,10 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     }
   }
 
-  // 4) 从DOM遍历提取（最后手段，使用 a-text-bold + next() 避免嵌套问题）
+  // 4) 从DOM遍历提取（使用 a-text-bold + next() 避免嵌套问题）
   if (!product.sku) {
     const skuKeywords = ['item model number', 'sku', 'model number', 'part number', 'model #', 'manufacturer'];
-    const detailRows = $('#productDetails_detailBullets_sections1 tr, #productDetails_techSpec_section_1 tr, #detailBullets_feature_div li');
+    const detailRows = $('#productDetails_detailBullets_sections1 tr, #productDetails_techSpec_section_1 tr, #detailBullets_feature_div li, #productDetails_db_sections tr');
     detailRows.each((i, row) => {
       // 尝试 table 格式 (tr > th + td)
       const labelTh = $(row).find('th').text().trim().toLowerCase().replace(/:$/, '');
@@ -873,6 +939,15 @@ function parseProductDetail(html, asin, siteConfig, lang) {
         }
       }
     });
+  }
+
+  // 5) 从原始HTML正则提取（最可靠的后备方案，不依赖DOM结构）
+  if (!product.sku) {
+    const skuRegex = /(?:Item model number|SKU|Model Number|Part Number|Model\s*#|Manufacturer part number)\s*(?::|<\/th>\s*<td[^>]*>)\s*([^<]+)/i;
+    const skuMatch = html.match(skuRegex);
+    if (skuMatch && skuMatch[1]) {
+      product.sku = skuMatch[1].trim();
+    }
   }
 
   // 分类路径 (breadcrumb)
