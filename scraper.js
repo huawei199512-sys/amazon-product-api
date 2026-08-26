@@ -635,33 +635,64 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   });
   product.description_images = [...new Set(detailImages)];
 
-  // 技术详情
-  const techDetails = $('#productDetails_techSpec_section_1').first();
-  if (techDetails.length) {
-    product.tech_details = {};
-    techDetails.find('tr').each((i, row) => {
-      const key = $(row).find('th').text().trim();
-      const value = $(row).find('td').text().trim();
-      if (key) product.tech_details[key] = value;
-    });
-  }
-  
-  // 产品详情表格
-  const detailTable = $('#productDetails_detailBullets_sections1, #detailBullets_feature_div').first();
-  if (detailTable.length) {
-    product.detail_table = {};
-    detailTable.find('li, tr').each((i, row) => {
-      const keyElem = $(row).find('span, th').first();
-      const valueElem = $(row).find('span:not(:first), td').first();
-      if (keyElem.length && valueElem.length) {
-        const key = keyElem.text().trim().replace(/:$/, '');
-        const value = valueElem.text().trim();
-        if (key && value && key.length < 100) {
-          product.detail_table[key] = value;
+  // 技术详情（多个Amazon页面ID备选）
+  const techDetailSelectors = [
+    '#productDetails_techSpec_section_1',
+    '#productDetails_techSpec_section_2',
+    '#productDetails_techSpec_section_3',
+    '#techSpec_section_1',
+    '#productSpecifications',
+    '.tech-specs',
+    '#productDetails_db_sections tr',
+    '#product_details_tabs tr',
+  ];
+  product.tech_details = {};
+  for (const sel of techDetailSelectors) {
+    const techDetails = $(sel).first();
+    if (techDetails.length) {
+      techDetails.find('tr').each((i, row) => {
+        const key = $(row).find('th').text().trim();
+        const value = $(row).find('td').text().trim();
+        if (key && !product.tech_details[key]) {
+          product.tech_details[key] = value;
         }
-      }
-    });
+      });
+      if (Object.keys(product.tech_details).length > 0) break;
+    }
   }
+  if (Object.keys(product.tech_details).length === 0) delete product.tech_details;
+  
+  // 产品详情表格（多个Amazon页面ID备选）
+  const detailTableSelectors = [
+    '#productDetails_detailBullets_sections1',
+    '#detailBullets_feature_div',
+    '#productDetails_detailBullets_sections2',
+    '#productDetails_detailBullets_sections3',
+    '#productDetails_navInfo_sections',
+    '#productDetails_db_sections',
+    '#product-details-table',
+    '.detail-bullets',
+    '#detailBullets',
+  ];
+  product.detail_table = {};
+  for (const sel of detailTableSelectors) {
+    const detailTable = $(sel).first();
+    if (detailTable.length) {
+      detailTable.find('li, tr').each((i, row) => {
+        const keyElem = $(row).find('span, th').first();
+        const valueElem = $(row).find('span:not(:first), td').first();
+        if (keyElem.length && valueElem.length) {
+          const key = keyElem.text().trim().replace(/:$/, '');
+          const value = valueElem.text().trim();
+          if (key && value && key.length < 100 && !product.detail_table[key]) {
+            product.detail_table[key] = value;
+          }
+        }
+      });
+      if (Object.keys(product.detail_table).length > 0) break;
+    }
+  }
+  if (Object.keys(product.detail_table).length === 0) delete product.detail_table;
 
   // 主图
   const mainImageElem = $('#landingImage, #main-image').first();
@@ -771,10 +802,21 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   // ==================== 新增字段 ====================
 
   // SKU (Item model number / Manufacturer part number)
-  product.sku = '';
-  // 从detail_table中提取
-  if (product.detail_table) {
-    const skuKeys = ['Item model number', 'SKU', 'Model Number', 'Model', 'Model Number:', 'Part Number', 'Model #', 'Manufacturer part number'];
+  // 策略：LD+JSON > detail_table > tech_details > DOM遍历，找不到则为null
+  product.sku = null;
+
+  // 1) 优先从LD+JSON提取（最可靠）
+  const ldJsonSku = extractLdJson(html);
+  if (ldJsonSku.length > 0) {
+    const productData = ldJsonSku.find(item => item['@type'] === 'Product');
+    if (productData) {
+      product.sku = productData.sku || productData.mpn || productData.model || null;
+    }
+  }
+
+  // 2) 从detail_table中提取（备用）
+  if (!product.sku && product.detail_table) {
+    const skuKeys = ['Item model number', 'SKU', 'Model Number', 'Model', 'Model Number:', 'Part Number', 'Model #', 'Manufacturer part number', 'ASIN', 'UPC', 'EAN'];
     for (const key of skuKeys) {
       if (product.detail_table[key]) {
         product.sku = product.detail_table[key];
@@ -782,7 +824,8 @@ function parseProductDetail(html, asin, siteConfig, lang) {
       }
     }
   }
-  // 从tech_details中提取
+
+  // 3) 从tech_details中提取（备用）
   if (!product.sku && product.tech_details) {
     const skuKeys = ['Item model number', 'SKU', 'Model Number', 'Model', 'Part Number', 'Model #'];
     for (const key of skuKeys) {
@@ -792,29 +835,21 @@ function parseProductDetail(html, asin, siteConfig, lang) {
       }
     }
   }
-  // 从LD+JSON中提取
+
+  // 4) 从DOM遍历提取（最后手段，cheerio不支持:contains，改用filter遍历）
   if (!product.sku) {
-    const ldJson = extractLdJson(html);
-    if (ldJson.length > 0) {
-      const productData = ldJson.find(item => item['@type'] === 'Product');
-      if (productData) {
-        product.sku = productData.sku || productData.mpn || productData.model || '';
+    const skuKeywords = ['item model number', 'sku', 'model number', 'part number', 'model #', 'manufacturer'];
+    const detailRows = $('#productDetails_detailBullets_sections1 tr, #productDetails_techSpec_section_1 tr, #detailBullets_feature_div li');
+    detailRows.each((i, row) => {
+      const label = $(row).find('th, span:first').text().trim().toLowerCase().replace(/:$/, '');
+      if (skuKeywords.some(k => label.includes(k))) {
+        const value = $(row).find('td, span:not(:first)').first().text().trim();
+        if (value) {
+          product.sku = value;
+          return false; // break each loop
+        }
       }
-    }
-  }
-  // 从selectors中提取
-  if (!product.sku) {
-    const skuSelectors = ['#productDetails_detailBullets_sections1 tr:contains("Item model number") td',
-      '#productDetails_detailBullets_sections1 tr:contains("SKU") td',
-      '#productDetails_techSpec_section_1 tr:contains("Item model number") td',
-      '#productDetails_techSpec_section_1 tr:contains("SKU") td'];
-    for (const sel of skuSelectors) {
-      const elem = $(sel).first();
-      if (elem.length) {
-        product.sku = elem.text().trim();
-        break;
-      }
-    }
+    });
   }
 
   // 分类路径 (breadcrumb)
@@ -831,17 +866,20 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     product.category_path = categories.filter(c => c);
   }
 
-  // Best Sellers Rank
-  const bsrElem = $('#productDetails_detailBullets_sections1 tr:contains("Best Sellers Rank") td, #detailBullets_feature_div li:contains("Best Sellers Rank")');
-  if (bsrElem.length) {
-    const bsrText = bsrElem.text().trim();
-    product.best_sellers_rank = bsrText;
-    // 提取排名数字
-    const rankMatch = bsrText.match(/#([\d,]+)/);
-    if (rankMatch) {
-      product.best_sellers_rank_value = parseInt(rankMatch[1].replace(/,/g, ''));
+  // Best Sellers Rank（cheerio不支持:contains，改用filter遍历）
+  const bsrKeywords = ['best sellers rank', 'best seller rank', '商品排名', '销售排名'];
+  const bsrRows = $('#productDetails_detailBullets_sections1 tr, #detailBullets_feature_div li, #productDetails_db_sections tr, .detail-bullets li');
+  bsrRows.each((i, row) => {
+    const text = $(row).text().trim().toLowerCase();
+    if (bsrKeywords.some(k => text.includes(k))) {
+      product.best_sellers_rank = $(row).text().trim();
+      const rankMatch = product.best_sellers_rank.match(/#([\d,]+)/);
+      if (rankMatch) {
+        product.best_sellers_rank_value = parseInt(rankMatch[1].replace(/,/g, ''));
+      }
+      return false;
     }
-  }
+  });
 
   // "About this item" bullet points
   const aboutBullets = $('#feature-bullets ul.a-unordered-list li, #feature-bullets .a-list-item');
@@ -1333,28 +1371,28 @@ function extractSkuDetails(html, $, variants) {
 
 function extractSpecifications($) {
   const specs = [];
+  const seenKeys = new Set();
   
-  // 方式1: 从detailBullets_feature_div提取
-  $('#detailBullets_feature_div li').each((i, li) => {
-    const spans = $(li).find('span');
-    if (spans.length >= 2) {
-      const key = $(spans[0]).text().trim().replace(/:$/, '');
-      const value = $(spans[1]).text().trim();
-      if (key && value && key !== '\u200f' && key.length < 100) {
+  const specSelectors = [
+    '#detailBullets_feature_div li',
+    '#productDetails_detailBullets_sections1 tr',
+    '#productDetails_db_sections tr',
+    '#productDetails_navInfo_sections tr',
+    '.detail-bullets li',
+    '#productSpecifications tr',
+  ];
+  
+  for (const sel of specSelectors) {
+    $(sel).each((i, el) => {
+      const key = $(el).find('th, span:first').text().trim().replace(/:$/, '');
+      const value = $(el).find('td, span:not(:first)').first().text().trim();
+      if (key && value && key !== '\u200f' && key.length < 100 && !seenKeys.has(key)) {
+        seenKeys.add(key);
         specs.push({ key, value });
       }
-    }
-  });
-  
-  // 方式2: 从productDetails_detailBullets提取
-  $('#productDetails_detailBullets_sections1 tr').each((i, row) => {
-    const key = $(row).find('th').text().trim();
-    const value = $(row).find('td').text().trim();
-    if (key && value && key.length < 100) {
-      const exists = specs.find(s => s.key === key);
-      if (!exists) specs.push({ key, value });
-    }
-  });
+    });
+    if (specs.length > 0) break;
+  }
   
   return specs;
 }
@@ -1362,14 +1400,25 @@ function extractSpecifications($) {
 function extractAttributes($) {
   const attributes = {};
   
-  // 从attribute_list提取
-  $('#detailBullets_feature_div li, #productDetails_detailBullets_sections1 tr').each((i, el) => {
-    const key = $(el).find('span:first, th:first').text().trim().replace(/:$/, '');
-    const value = $(el).find('span:not(:first), td:first').text().trim();
-    if (key && value && key.length < 50) {
-      attributes[key] = value;
-    }
-  });
+  const attrSelectors = [
+    '#detailBullets_feature_div li',
+    '#productDetails_detailBullets_sections1 tr',
+    '#productDetails_db_sections tr',
+    '#productDetails_navInfo_sections tr',
+    '.detail-bullets li',
+    '#productSpecifications tr',
+  ];
+  
+  for (const sel of attrSelectors) {
+    $(sel).each((i, el) => {
+      const key = $(el).find('span:first, th:first').text().trim().replace(/:$/, '');
+      const value = $(el).find('span:not(:first), td:first').text().trim();
+      if (key && value && key.length < 50 && !attributes[key]) {
+        attributes[key] = value;
+      }
+    });
+    if (Object.keys(attributes).length > 0) break;
+  }
   
   return attributes;
 }
