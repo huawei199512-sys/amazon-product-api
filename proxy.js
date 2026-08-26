@@ -13,7 +13,7 @@ class ProxyManager {
     this.proxies = [...this.knownGoodProxies];
     this.badProxies = new Map(); // proxy -> timestamp
     this.enabled = true; // 强制开启代理
-    this.maxUsesPerProxy = 1; // 单个代理仅使用1次（免费代理不可靠，用完即换）
+    this.maxUsesPerProxy = 3; // 单个代理最多使用3次后轮换（之前1次太激进）
     this.usedCount = new Map();
     this.lastRefreshTime = 0;
     this.refreshInterval = 120; // 2分钟最小刷新间隔
@@ -389,21 +389,19 @@ class ProxyManager {
       return this.verifiedPool;
     }
 
-    console.log(`[AmazonProxy] 开始预验证 ${proxyList.length} 个代理（快速连通性测试）...`);
+    // 限制验证数量，最多500个（避免验证时间过长）
+    const toVerify = proxyList.slice(0, 500);
+    console.log(`[AmazonProxy] 开始预验证 ${toVerify.length}/${proxyList.length} 个代理（快速连通性测试）...`);
     this.verifying = true;
     const verified = [];
-    const batchSize = 50; // 每批验证50个
-    const testTimeout = 5000; // 5秒超时
+    const batchSize = 30; // 每批验证30个（SOCKS较慢，减小并发）
+    const testTimeout = 8000; // 8秒超时（SOCKS较慢，给多点时间）
 
     // 分批验证
-    for (let i = 0; i < proxyList.length; i += batchSize) {
-      const batch = proxyList.slice(i, i + batchSize);
+    for (let i = 0; i < toVerify.length; i += batchSize) {
+      const batch = toVerify.slice(i, i + batchSize);
       const results = await Promise.allSettled(
         batch.map(async (proxy) => {
-          const protocol = this.getProxyProtocol(proxy);
-          // SOCKS代理跳过预验证（速度慢，直接用）
-          if (protocol.startsWith('socks')) return { proxy, ok: false };
-          
           try {
             const agent = this.createAgent(proxy);
             const controller = new AbortController();
@@ -467,18 +465,26 @@ class ProxyManager {
       const merged = new Set([...this.knownGoodProxies, ...existingGood, ...newProxies]);
       const mergedList = Array.from(merged).filter((p) => !this.badProxies.has(p));
 
+      // *** 关键修复：先立即填充代理池，让请求能拿到代理 ***
+      // 如果当前池子太小，先用未验证的代理填充，避免请求期间无代理可用
+      if (this.proxies.length < 50 && mergedList.length > 0) {
+        this.proxies = mergedList;
+        this.usedCount.clear();
+        console.log(`[AmazonProxy] 快速填充: ${mergedList.length} 个未验证代理 (后台验证中...)`);
+      }
+
       // 预验证：对合并后的代理池做快速连通性测试
-      // 只对非SOCKS、非已知好代理做验证
+      // 对所有非已知好代理做验证（包括HTTP和SOCKS）
       const needVerify = mergedList.filter(
-        p => !this.knownGoodProxies.includes(p) && !p.startsWith('socks')
+        p => !this.knownGoodProxies.includes(p) && !this.badProxies.has(p)
       );
       const verified = needVerify.length > 0 ? await this.verifyProxies(needVerify) : [];
 
-      // 最终池：已知好代理 + 已验证通过 + 未验证的SOCKS
+      // 最终池：已知好代理 + 已验证通过
+      // 只有验证通过的才会进入代理池，避免浪费时间试不可达的代理
       const finalList = [
         ...this.knownGoodProxies.filter(p => !this.badProxies.has(p)),
         ...verified,
-        ...mergedList.filter(p => p.startsWith('socks') && !this.badProxies.has(p) && !this.knownGoodProxies.includes(p)),
       ];
 
       this.proxies = finalList;

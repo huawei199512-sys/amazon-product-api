@@ -294,7 +294,7 @@ async function searchProducts(keyword, country = 'com', lang = 'en', page = 1) {
 
   return {
     success: true,
-    data_version: '1.2', // 版本标记方便验证
+    data_version: '1.4', // 版本标记方便验证
     keyword,
     country,
     page,
@@ -489,7 +489,7 @@ async function getProductDetail(asin, country = 'com', lang = 'en') {
 
   return {
     success: true,
-    data_version: '1.2', // 版本标记方便验证
+    data_version: '1.4', // 版本标记方便验证
     asin,
     country,
     product,
@@ -1079,7 +1079,7 @@ function parseProductDetail(html, asin, siteConfig, lang) {
     }
   }
   // 检查是否有闪电特价
-  const lightningDealBadge = $('.deal-share-badge, .gb-font-lighting-deal, .a-deal-badge, .badgeText:contains("Deal")').first();
+  const lightningDealBadge = $('.deal-share-badge, .gb-font-lighting-deal, .a-deal-badge, .badgeText').filter((i, el) => $(el).text().includes('Deal')).first();
   if (lightningDealBadge.length) {
     product.is_deal = true;
     product.deal_type = 'Lightning Deal';
@@ -1091,7 +1091,7 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   }
 
   // 订阅折扣 (Subscribe & Save)
-  const sasElem = $('.a-price-savings:contains("Subscribe"), .sns-promotion, #sns-promotion, [data-sns-promotion]').first();
+  const sasElem = $('.a-price-savings, .sns-promotion, #sns-promotion, [data-sns-promotion]').filter((i, el) => $(el).text().includes('Subscribe')).first();
   if (sasElem.length || html.includes('Subscribe & Save') || html.includes('subscribe-and-save')) {
     product.subscribe_and_save = true;
     const sasText = sasElem.length ? sasElem.text().trim() : '';
@@ -1101,7 +1101,7 @@ function parseProductDetail(html, asin, siteConfig, lang) {
   }
 
   // 退货政策
-  const returnElem = $('#returns-policy, #return-policy, .a-expander-content:contains("Return"), [data-feature-name="return-policy"]').first();
+  const returnElem = $('#returns-policy, #return-policy, .a-expander-content, [data-feature-name="return-policy"]').filter((i, el) => $(el).text().includes('Return')).first();
   if (returnElem.length) {
     product.return_policy = returnElem.text().trim().substring(0, 500);
   }
@@ -1152,6 +1152,9 @@ function extractAllSkuData(html, $) {
   // 方式5: 从variation_parts提取
   extractFromVariationParts($, result, seenAsins);
   
+  // 方式6: 从HTML数据属性提取（最可靠，不依赖DOM结构）
+  extractFromDataAttributes(html, result, seenAsins);
+  
   // 提取SKU详情
   if (result.variants.length > 0) {
     result.details = extractSkuDetails(html, $, result.variants);
@@ -1171,6 +1174,9 @@ function extractFromJsonData(html, result, seenAsins) {
       { regex: /"item\.skus":\s*(\[[\s\S]*?\])/, type: 'skus' },
       { regex: /"result\.skus":\s*(\[[\s\S]*?\])/, type: 'skus' },
       { regex: /"detailData\.skus":\s*(\[[\s\S]*?\])/, type: 'skus' },
+      { regex: /"variationValues"\s*:\s*(\{[\s\S]*?\})\s*[,}]/, type: 'variationValues' },
+      { regex: /"parentAsin"\s*:\s*"([A-Z0-9]{10})"/, type: 'parentAsin' },
+      { regex: /"childAsins"\s*:\s*(\[[\s\S]*?\])/, type: 'childAsins' },
     ];
 
     for (const { regex, type } of patterns) {
@@ -1375,6 +1381,102 @@ function extractFromVariationParts($, result, seenAsins) {
       });
     }
   });
+}
+
+function extractFromDataAttributes(html, result, seenAsins) {
+  try {
+    // 方式1: data-default-asin 属性（Amazon标准格式）
+    const defaultAsinRegex = /data-default-asin\s*=\s*["']([A-Z0-9]{10})["']/gi;
+    let match;
+    while ((match = defaultAsinRegex.exec(html)) !== null) {
+      if (!seenAsins.has(match[1])) {
+        seenAsins.add(match[1]);
+        result.variants.push({ asin: match[1], source: 'data-default-asin' });
+      }
+    }
+    
+    // 方式2: data-asin 属性（图片/按钮上的变体ASIN）
+    const dataAsinRegex = /data-asin\s*=\s*["']([A-Z0-9]{10})["']/gi;
+    while ((match = dataAsinRegex.exec(html)) !== null) {
+      if (!seenAsins.has(match[1])) {
+        seenAsins.add(match[1]);
+        result.variants.push({ asin: match[1], source: 'data-asin' });
+      }
+    }
+    
+    // 方式3: data-image-url 属性（变体图片URL）
+    const imageUrlRegex = /data-image-url\s*=\s*["']([^"']+)["']/gi;
+    const imageUrlMap = new Map();
+    while ((match = imageUrlRegex.exec(html)) !== null) {
+      if (match[1]) {
+        const url = match[1].trim();
+        const before = html.substring(0, match.index);
+        const nearbyAsin = before.match(/data-(?:default-)?asin\s*=\s*["']([A-Z0-9]{10})["'][^]*$/);
+        if (nearbyAsin && !imageUrlMap.has(nearbyAsin[1])) {
+          imageUrlMap.set(nearbyAsin[1], url);
+        }
+      }
+    }
+    if (imageUrlMap.size > 0) {
+      for (const variant of result.variants) {
+        if (imageUrlMap.has(variant.asin) && !variant.image) {
+          variant.image = imageUrlMap.get(variant.asin);
+        }
+      }
+    }
+    
+    // 方式4: 从colorImages JSON数据提取
+    const colorImagesRegex = /colorImages\s*:\s*(\{[\s\S]*?\})\s*,\s*colorImages/;
+    const colorImagesMatch = html.match(colorImagesRegex);
+    if (colorImagesMatch) {
+      try {
+        const colorData = JSON.parse(colorImagesMatch[1]);
+        for (const [color, images] of Object.entries(colorData)) {
+          if (Array.isArray(images) && images.length > 0) {
+            const firstImage = images[0];
+            const asin = firstImage.asin || (firstImage.main && firstImage.main.asin) || '';
+            const imageUrl = (firstImage.main && firstImage.main.url) || firstImage.url || '';
+            if (asin && !seenAsins.has(asin)) {
+              seenAsins.add(asin);
+              result.variants.push({ asin, title: color, image: imageUrl || '', source: 'colorImages' });
+            }
+          }
+        }
+      } catch {}
+    }
+    
+    // 方式5: 从data-a-input-name提取变体标签
+    const attrRegex = /data-a-input-name\s*=\s*["']([^"']+)["'][^>]*data-a-id-for-attribute\s*=\s*["']([^"']+)["']/gi;
+    while ((match = attrRegex.exec(html)) !== null) {
+      const before = html.substring(0, match.index);
+      const nearbyAsin = before.match(/data-(?:default-)?asin\s*=\s*["']([A-Z0-9]{10})["'][^]*$/);
+      if (nearbyAsin && !seenAsins.has(nearbyAsin[1])) {
+        seenAsins.add(nearbyAsin[1]);
+        result.variants.push({ asin: nearbyAsin[1], title: match[2], attribute: match[1], source: 'data-attribute' });
+      }
+    }
+    
+    // 方式6: 从dimensionValuesDisplayData JSON提取
+    const dimensionRegex = /"dimensionValuesDisplayData"\s*:\s*\{([\s\S]*?)(?:"\s*,\s*"[a-z]|"variationValues")/i;
+    const dimMatch = html.match(dimensionRegex);
+    if (dimMatch) {
+      try {
+        const dimData = JSON.parse('{' + dimMatch[1] + '}');
+        for (const [key, values] of Object.entries(dimData)) {
+          if (typeof values === 'object' && values.title) {
+            const asinPattern = new RegExp(`"${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^}]*?"asin"\\s*:\\s*"([A-Z0-9]{10})"`, 'i');
+            const asinMatch = html.match(asinPattern);
+            if (asinMatch && !seenAsins.has(asinMatch[1])) {
+              seenAsins.add(asinMatch[1]);
+              result.variants.push({ asin: asinMatch[1], title: values.title, image: values.imageUrl || '', source: 'dimensionValues' });
+            }
+          }
+        }
+      } catch {}
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function extractSkuDetails(html, $, variants) {
